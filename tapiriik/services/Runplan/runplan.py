@@ -2,7 +2,7 @@ from tapiriik.settings import WEB_ROOT, RUNPLAN_CLIENT_SECRET, RUNPLAN_CLIENT_ID
 from tapiriik.services.service_base import ServiceAuthenticationType, ServiceBase
 from tapiriik.services.service_record import ServiceRecord
 from tapiriik.services.interchange import UploadedActivity, ActivityType, ActivityStatistic, ActivityStatisticUnit, \
-    Waypoint, WaypointType, Location, Lap
+    Waypoint, WaypointType, Location, Lap, LapIntensity
 from tapiriik.services.api import APIException, UserException, UserExceptionType, APIExcludeActivity
 from tapiriik.services.fit import FITIO
 from tapiriik.services.tcx import TCXIO
@@ -35,11 +35,23 @@ class RunplanService(ServiceBase):
     #runplan_url = "http://localhost:8010"
     runplan_url = "http://10.0.2.2:8010"
 
-    SupportsHR = SupportsCadence = SupportsTemp = SupportsPower = True
-
+    SupportedActivities = [ActivityType.Running]
+    SupportsHR = SupportsCalories = SupportsCadence = SupportsTemp = True
     SupportsActivityDeletion = False
 
-    SupportedActivities = ActivityType.List() # All
+    _reverseActivityMappings = {
+        ActivityType.Running: "running",
+    }
+    _activityMappings = {
+        "running": ActivityType.Running,
+    }
+
+    _intensityMappings = {
+        LapIntensity.Active: 'work',
+        LapIntensity.Rest: 'recovery',
+        LapIntensity.Warmup: 'warmup',
+        LapIntensity.Cooldown: 'cooldown',
+    }
 
     def UserUploadedActivityURL(self, uploadId):
         raise NotImplementedError
@@ -53,7 +65,6 @@ class RunplanService(ServiceBase):
             "response_type": "code",
             "redirect_uri": WEB_ROOT + reverse("oauth_return", kwargs={"service": "runplan"})
         }
-        #self.UserAuthorizationURL = self.runplan_url + "/oauth/authorise?" + urlencode(params)
         self.UserAuthorizationURL = "http://localhost:8010/oauth/authorise?" + urlencode(params)
 
     def _apiHeaders(self, authorization):
@@ -68,77 +79,82 @@ class RunplanService(ServiceBase):
             "client_secret": RUNPLAN_CLIENT_SECRET,
             "redirect_uri": WEB_ROOT + reverse("oauth_return", kwargs={"service": "runplan"})
         }
-        #url = "http://10.0.2.2:8010/oauth/token"
-        url = "{}/oauth/token".format(self.runplan_url)
-
-        print('REQUEST >>>>> ', url)
-        response = requests.post(url, data=params)
-
-        print('RESPONSE >>> ', response.text)
+        response = requests.post("{}/oauth/token".format(self.runplan_url), data=params)
 
         if response.status_code != 200:
             raise APIException("Invalid code")
         data = response.json()
 
-        authorizationData = {"OAuthToken": data["access_token"]}
+        authorizationData = {"OAuthToken": data.get("access_token")}
 
-        id_resp = requests.get("{}/api/sync/user".format(self.runplan_url), headers=self._apiHeaders(authorizationData))
-        return (id_resp.json()["id"], authorizationData)
+        reponse_uuid = requests.get(
+            "{}/api/p1/sync/user/uuid".format(self.runplan_url),
+            headers=self._apiHeaders(authorizationData)
+        )
+        if response.status_code != 200:
+            raise APIException("Invalid call to user")
 
+        user_uuid = reponse_uuid.json().get("uuid")
+
+        return user_uuid, authorizationData
 
 
     def RevokeAuthorization(self, serviceRecord):
+
         resp = requests.post(
-            self.runplan_url + "/api/oauth/revoke",
-            data={"token": serviceRecord.Authorization["OAuthToken"]},
+            "{}/oauth/revoke".format(self.runplan_url),
+            data={"token": serviceRecord.Authorization.get("OAuthToken"), "client_id": RUNPLAN_CLIENT_ID},
             headers=self._apiHeaders(serviceRecord.Authorization)
         )
+
         if resp.status_code != 204 and resp.status_code != 200:
-            raise APIException("Unable to deauthorize TAO auth token, status " + str(resp.status_code) + " resp " + resp.text)
+            raise APIException("Unable to deauthorize Runplan auth token, status " + str(resp.status_code) + " resp " + resp.text)
         pass
 
     def DownloadActivityList(self, serviceRecord, exhaustive=False):
-        allItems = []
-
-        if exhaustive:
-            pageUri = self.runplan_url + "/api/sync/activities?pageSize=200"
-        else:
-            pageUri = self.runplan_url + "/api/sync/activities"
-
-        while True:
-            response = requests.get(pageUri,  headers=self._apiHeaders(serviceRecord.Authorization))
-            if response.status_code != 200:
-                if response.status_code == 401 or response.status_code == 403:
-                    raise APIException(
-                        "No authorization to retrieve activity list",
-                        block=True,
-                        user_exception=UserException(UserExceptionType.Authorization,
-                        intervention_required=True)
-                    )
-                raise APIException("Unable to retrieve activity list " + str(response) + " " + response.text)
-            data = response.json()
-            allItems += data["activities"]
-            if not exhaustive or "next" not in data or data["next"] is None:
-                break
-            pageUri = self.runplan_url + data["next"]
-
         activities = []
         exclusions = []
-        for act in allItems:
-            try:
-                activity = self._populateActivity(act)
-            except KeyError as e:
-                exclusions.append(
-                    APIExcludeActivity("Missing key in activity data " + str(e),
-                    activity_id=act["activityId"],
-                    user_exception=UserException(UserExceptionType.Corrupt))
-                )
-                continue
 
-            logger.debug("\tActivity s/t " + str(activity.StartTime))
-            activity.ServiceData = {"id": act["activityId"]}
-            activities.append(activity)
-        return activities, exclusions
+        resp = requests.get(
+            "{}/api/p1/sync/activities".format(self.runplan_url),
+            headers=self._apiHeaders(serviceRecord.Authorization)
+        )
+
+        try:
+            act_list = resp.json()["data"]
+
+            for act in act_list:
+                activity = UploadedActivity()
+                activity.StartTime = dateutil.parser.parse(act['startDateTimeLocal'])
+                activity.EndTime = activity.StartTime + timedelta(seconds=act['duration'])
+                _type = self._activityMappings.get(act['activityType'])
+                if not _type:
+                    exclusions.append(APIExcludeActivity("Unsupported activity type %s" % act['activityType'],
+                                                         activity_id=act["activityId"],
+                                                         user_exception=UserException(UserExceptionType.Other)))
+                activity.ServiceData = {"ActivityID": act['activityId']}
+                activity.Type = _type
+                activity.Notes = act['notes']
+                activity.GPS = bool(act.get('startLatitude'))
+                activity.Stats.Distance = ActivityStatistic(ActivityStatisticUnit.Kilometers, value=act['distance'])
+                activity.Stats.Energy = ActivityStatistic(ActivityStatisticUnit.Kilocalories, value=act['calories'])
+                if 'heartRateMin' in act:
+                    activity.Stats.HR = ActivityStatistic(ActivityStatisticUnit.BeatsPerMinute, min=act['heartRateMin'],
+                                                          max=act['heartRateMax'], avg=act['heartRateAverage'])
+                activity.Stats.MovingTime = ActivityStatistic(ActivityStatisticUnit.Seconds, value=act['duration'])
+
+                if 'temperature' in act:
+                    activity.Stats.Temperature = ActivityStatistic(ActivityStatisticUnit.DegreesCelcius,
+                                                                   avg=act['temperature'])
+                activity.CalculateUID()
+                logger.debug("\tActivity s/t %s", activity.StartTime)
+                activities.append(activity)
+
+            return activities, exclusions
+
+        except ValueError:
+            self._rateLimitBailout(resp)
+            raise APIException("Error decoding activity list resp %s %s" % (resp.status_code, resp.text))
 
     def _populateActivity(self, rawRecord):
         ''' Populate the 1st level of the activity object with all details required for UID from  API data '''

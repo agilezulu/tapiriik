@@ -236,7 +236,11 @@ class RunplanService(ServiceBase):
             data={'activity': json.dumps(data)},
             headers=self._apiHeaders(serviceRecord.Authorization)
         )
-        return resp.json().get("data")
+
+        rp_uuid = resp.json()
+        uuid = rp_uuid.get("data") if rp_uuid else None
+        logger.debug("Runplan UUID: {}".format(uuid))
+        return uuid
 
     def UploadActivity(self, serviceRecord, activity):
         data = {}
@@ -321,6 +325,8 @@ class RunplanService(ServiceBase):
         data['recordingKeys'] = sorted(recordings.keys())
         data['recordingValues'] = [recordings[k] for k in data['recordingKeys']]
         assert len(set(len(v) for v in data['recordingValues'])) == 1
+
+        logger.debug("Runplan Upload: {} {}".format(activity.Name, activity.UID))
 
         return self._createActivity(serviceRecord, data)
 

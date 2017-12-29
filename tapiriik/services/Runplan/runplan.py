@@ -110,14 +110,21 @@ class RunplanService(ServiceBase):
     def DownloadActivityList(self, serviceRecord, exhaustive=False):
         activities = []
         exclusions = []
+        url = "{}/api/p1/sync/activities".format(self.runplan_url)
+        headers = self._apiHeaders(serviceRecord.Authorization)
+        items_per_page = 20
+        page = 1
+        paging = {}
 
-        resp = requests.get(
-            "{}/api/p1/sync/activities".format(self.runplan_url),
-            headers=self._apiHeaders(serviceRecord.Authorization)
-        )
-
-        try:
+        while True:
+            paging.update(items_per_page=items_per_page, page=page)
+            resp = requests.get(url, headers=headers, params=paging)
+            resp.raise_for_status()
             act_list = resp.json().get("data")
+            logger.debug("Runplan Download: page {}".format(page))
+
+            if not act_list or len(act_list) == 0:
+                break
 
             for act in act_list:
                 activity = UploadedActivity()
@@ -152,17 +159,18 @@ class RunplanService(ServiceBase):
                         ActivityStatisticUnit.DegreesCelcius, avg=act.get("temperature"))
 
                 activity.CalculateUID()
-                logger.debug("\tActivity s/t %s", activity.StartTime)
+                logger.debug("\tRunplan Activity s/t {}".format(activity.StartTime))
                 activities.append(activity)
 
-            return activities, exclusions
+            if not exhaustive:
+                break
+            else:
+                page += 1
 
-        except ValueError:
-            raise APIException("Error decoding activity list resp {} {}".format(resp.status_code, resp.text))
+        return activities, exclusions
 
     def DownloadActivity(self, serviceRecord, activity):
         activity_id = activity.ServiceData.get("ActivityID")
-
         resp = requests.get(
             "{}/api/p1/sync/activity/{}".format(self.runplan_url, activity_id),
             headers=self._apiHeaders(serviceRecord.Authorization)
@@ -236,11 +244,15 @@ class RunplanService(ServiceBase):
             data={'activity': json.dumps(data)},
             headers=self._apiHeaders(serviceRecord.Authorization)
         )
+        if resp.status_code == requests.codes.ok:
+            return resp.json().get("data")
+        return None
 
-        rp_uuid = resp.json()
-        uuid = rp_uuid.get("data") if rp_uuid else None
-        logger.debug("Runplan UUID: {}".format(uuid))
-        return uuid
+    def _calc_running_avg(self, previous_avg, current_val, index):
+        if index == 0 or current_val is None:
+            return 0
+        # [avg * (n-1) + x ] / n
+        return 0 if not index else (previous_avg * (index - 1) + current_val) / index
 
     def UploadActivity(self, serviceRecord, activity):
         data = {}
@@ -258,12 +270,19 @@ class RunplanService(ServiceBase):
                     return
 
         setIfNotNone(data, 'notes', activity.Notes, activity.Name)
+        setIfNotNone(data, 'calories', activity.Stats.Energy.Value, f=int)
         setIfNotNone(data, 'cadenceAverage', activity.Stats.RunCadence.Average, f=int)
         setIfNotNone(data, 'cadenceMin', activity.Stats.RunCadence.Min, f=int)
         setIfNotNone(data, 'cadenceMax', activity.Stats.RunCadence.Max, f=int)
         setIfNotNone(data, 'heartRateAverage', activity.Stats.HR.Average, f=int)
         setIfNotNone(data, 'heartRateMin', activity.Stats.HR.Min, f=int)
         setIfNotNone(data, 'heartRateMax', activity.Stats.HR.Max, f=int)
+
+        setIfNotNone(data, 'elevationMin', activity.Stats.Elevation.Min, f=int)
+        setIfNotNone(data, 'elevationMax', activity.Stats.Elevation.Max, f=int)
+        setIfNotNone(data, 'elevationGain', activity.Stats.Elevation.Gain, f=int)
+        setIfNotNone(data, 'elevationLoss', activity.Stats.Elevation.Loss, f=int)
+
         setIfNotNone(data, 'temperatureAverage', activity.Stats.Temperature.Average)
 
         if not activity.Laps[0].Waypoints:
@@ -296,6 +315,14 @@ class RunplanService(ServiceBase):
         hasCadence = hasStat(activity, 'RunCadence')
         hasTemp = hasStat(activity, 'Temp')
 
+        hrMin = 500
+        hrMax = 0
+        cadMin = 500
+        cadMax = 0
+        cad_avg = 0
+        tempMin = 500
+        tempMax = 0
+        cad_idx = 0
         for lap in activity.Laps:
             lapinfo = {
                 'lapType': self._intensityMappings.get(lap.Intensity, 'general'),
@@ -317,10 +344,52 @@ class RunplanService(ServiceBase):
                     recordings['elevation'].append(wp.Location.Altitude)
                 if hasHeartRate:
                     recordings['heartRate'].append(wp.HR)
+                    if wp.HR:
+                        hrMin = wp.HR if wp.HR < hrMin else hrMin
+                        hrMax = wp.HR if wp.HR > hrMax else hrMax
                 if hasCadence:
                     recordings['cadence'].append(wp.RunCadence)
+                    if wp.RunCadence:
+                        cadMin = wp.RunCadence if wp.RunCadence < cadMin else cadMin
+                        cadMax = wp.RunCadence if wp.RunCadence > cadMax else cadMax
+                        cad_avg = self._calc_running_avg(cad_avg, wp.RunCadence, cad_idx)
+                        cad_idx += 1
                 if hasTemp:
                     recordings['temperature'].append(wp.Temp)
+                    if wp.Temp:
+                        tempMin = wp.Temp if wp.Temp < tempMin else tempMin
+                        tempMax = wp.Temp if wp.Temp > tempMax else tempMax
+
+
+        if hasCadence and 'cadenceMin' not in data:
+            data['cadenceMin'] = cadMin
+
+        if hasCadence and 'cadenceMax' not in data:
+            data['cadenceMax'] = cadMax
+
+        if hasCadence and 'cadenceAverage' not in data:
+            data['cadenceAverage'] = cad_avg
+
+        if hasHeartRate and 'heartRateMin' not in data:
+            data['heartRateMin'] = hrMin
+
+        if hasHeartRate and 'heartRateMax' not in data:
+            data['heartRateMax'] = hrMax
+
+        if hasTemp and 'temperatureAverage' not in data:
+            data['temperatureAverage'] = (tempMin + tempMax)/2
+
+        if hasTemp and 'temperatureMin' not in data:
+            data['temperatureMin'] = tempMin
+
+        if hasTemp and 'temperatureMax' not in data:
+            data['temperatureMax'] = tempMax
+
+        if hasLatitude and 'startLatitude' not in data:
+            data['startLatitude'] = activity.Laps[0].Waypoints[0].Location.Latitude
+
+        if hasLongitude and 'startLongitude' not in data:
+            data['startLongitude'] = activity.Laps[0].Waypoints[0].Location.Longitude
 
         data['recordingKeys'] = sorted(recordings.keys())
         data['recordingValues'] = [recordings[k] for k in data['recordingKeys']]
